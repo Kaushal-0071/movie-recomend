@@ -2,3 +2,6 @@
 
 credits.csv
 movies_metadata.csv
+wiki_movie_plots_deduped.csv
+similarity.pkl
+movie_dict.pkl

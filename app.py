@@ -11,8 +11,17 @@ from surprise import Reader, Dataset, SVD
 from surprise.model_selection import cross_validate
 from surprise.model_selection import train_test_split
 from flask import Flask, request, jsonify
-app = Flask(__name__)
+from flask_cors import CORS
+import pickle
+import re
+import json
 
+
+
+import google.generativeai as genai
+app = Flask(__name__)
+CORS(app)
+#collabrative filtering recommender
 class hybrid_recomsys:
 
     def __init__(self, metadata_path, links_small_path, ratings_small_path):
@@ -171,280 +180,7 @@ class hybrid_recomsys:
         return movies.head(display)
 
 
-
-
-class MergeCleanData:
-    
-    def __init__(self, metadata, credits, keywords):
-
-        self.df = pd.read_csv(metadata)
-        self.cred_df = pd.read_csv(credits)
-        self.key_df = pd.read_csv(keywords)
-
-        
-    def clean_as_int(self, x):
-        
-        """Function to convert 'x' to integers, if can not, return Nan"""
-        
-        try:
-            return int(x)
-        except:
-            return np.nan
-        
-    
-    def clean_ids(self, df):
-        
-        """Function to clean df for none-integer data
-        
-        Args:
-            df(object): the dataframe(pandas), which is the dataset
-            
-        Return:
-            df(object): the cleaned data where 'id' was converted as 'int'
-            
-        """
-        
-        #Clean the ids of df
-        df['id'] = df['id'].apply(self.clean_as_int)    
-                                  
-        #Filter all rows that have a null ID
-        df = df[df['id'].notnull()]
-        
-        return df
-    
-    def main(self):
-        
-        """Function to return combineed with 'id' reference
-        
-        Args:
-            none: 
-        
-        Return:
-            combined dataframe (object):
-        """
-        self.df = self.clean_ids(self.df)
-        self.cred_df = self.clean_ids(self.cred_df)
-        self.key_df = self.clean_ids(self.key_df)
-        
-        # Merge keywords and credits into your main metadata dataframe
-        self.df = self.df.merge(self.cred_df, on='id')
-        self.df = self.df.merge(self.key_df, on='id')
-        
-        return self.df 
-        
-class CreateSoup:
-    
-    def __init__(self, cleaned_data):
-        
-        self.df = cleaned_data
-        
-    def get_native_obj(self, df):
-        
-        """Function to return combineed with 'id' reference
-        
-        Args:
-            df(object): the dataframe(pandas), which is the dataset that contains 'features'
-        
-        Return:
-            dataframe (object): the dataframe that applied 'literal_eval' function
-        """
-        from ast import literal_eval
-        
-        # Convert the stringified objects into the native python objects
-        features = ['cast', 'crew', 'keywords', 'genres']
-        
-        for feature in features:
-            df[feature] = df[feature].apply(literal_eval)
-        
-        return df
-    
-    def get_director(self, x):
-        
-        """Function to extract the director's name. If director is not listed, return NaN"""
-
-        for crew_member in x:
-            if crew_member['job'] == 'Director':
-                return crew_member['name']
-        
-        return np.nan
-    
-    def generate_list(self, x, n=3):
-        
-        """Function to returns the list top 'n' elements or entire list"""
-        
-        if isinstance(x, list):
-            
-            names = [i['name'] for i in x]
-            #Check if more than 3 elements exist. If yes, return only first three. If no, return entire list.
-            if len(names) > n:
-                names = names[:n]
-            return names
-
-        #Return empty list in case of missing/malformed data
-        
-        return []
-
-    def sanitize(self, x):
-        
-        """Function to sanitize data to prevent ambiguity. It removes spaces and converts to lowercase"""
-        
-        if isinstance(x, list):
-            #Strip spaces and convert to lowercase
-            return [str.lower(i.replace(" ", "")) for i in x]
-        
-        else:
-            #Check if director exists. If not, return empty string
-            if isinstance(x, str):
-                return str.lower(x.replace(" ", ""))
-            else:
-                return ''
-    
-    def create_soup(self, x):
-        """Function that creates a soup out of the desired metadata"""
-        
-        return ' '.join(x['keywords']) + ' ' + ' '.join(x['cast']) + ' ' + x['director'] + ' ' + ' '.join(x['genres'])
-
-    def main(self):
-        
-        """Function to returns the soup of keywords, genres, cast, directer"""
-        
-        self.df = self.get_native_obj(self.df)
-        
-        #Define the new director feature
-        self.df['director'] =  self.df['crew'].apply(self.get_director)
-        
-        #Apply the generate_list function to cast and keywords
-        self.df['cast'] = self.df['cast'].apply(self.generate_list)
-        self.df['keywords'] = self.df['keywords'].apply(self.generate_list)
-        self.df['genres'] = self.df['genres'].apply(self.generate_list)
-        
-        #Only consider a maximum of 3 genres
-        n=3
-        self.df['genres'] = self.df['genres'].apply(lambda x: x[:n])
-
-        #Apply the generate_list function to cast, keywords, director and genres
-        for feature in ['cast', 'director', 'genres', 'keywords']:
-            #print(feature)
-            self.df[feature] = self.df[feature].apply(self.sanitize)
-            
-        # Create the new soup feature
-        self.df['soup'] = self.df.apply(self.create_soup, axis=1)
-        
-        return self.df
-    
-class ContentBasedRecommender:
-    
-    def __init__(self, database_soup):
-        
-        self.df = database_soup
-    
-    def cal_tfidf(self, df, stop_words_list=['english']):
-        
-        """Function to creat the Term Frequency-Inverse Document Frequency (TF-IDF) matrix
-
-        Args:
-            df(object): the dataframe(pandas), which is the dataset that contain 'overview' documents of movies
-            stop_words(list): the words that extremly commom in the 'overview' documents of movies
-        
-        Return:
-            tfidf_matrix (tensor): the word vecterized-matrix
-        """
-        
-        #Define a TF-IDF Vectorizer Object. Remove all english stopwords
-        tfidf = TfidfVectorizer(stop_words=stop_words_list)
-
-        #Replace NaN with an empty string
-        df['soup'] = df['soup'].fillna('')
-
-        #Construct the required TF-IDF matrix by applying the fit_transform method on the overview feature
-        tfidf_matrix = tfidf.fit_transform(df['soup'])
-        
-        return tfidf_matrix
-        
-    def get_cosine_sim(self, tfidf_matrix):
-        
-        """Function to compute the cosine similarity matrix 
-
-        Args:
-            tfidf_matrix (tensor): the word vecterized-matrix
-        
-        Return:
-            cosine similarity matrix(tensor)
-        """
-        
-        # Compute the cosine similarity matrix
-        cosine_sim = linear_kernel(tfidf_matrix, tfidf_matrix)
-
-        return cosine_sim
-    
-    def get_indices(self, df):
-        
-        """Function to construct a reverse mapping of indices and movie titles, 
-        and drop duplicate titles(if any)"""
-        
-        indices = pd.Series(df.index, index=df['title']).drop_duplicates()
-        
-        return indices
-        
-    def main(self, title_input, see_top=25, random_seed=42):
-        """Function to take in movie title as input and give recommendations using GPU.
-        
-        Args:
-            title_input (string): The movie name.
-            see_top (int): Number of recommendations to return.
-            random_seed (int): Seed for reproducibility.
-
-        Return:
-            recommendation (pd.DataFrame): Recommended movies.
-        """
-        try:
-            # Ensure the DataFrame index is sequential
-            self.df = self.df.reset_index(drop=True)
-            
-            # Obtain the index of the movie that matches the title
-            indices = self.get_indices(self.df)
-            idx = indices.get(title_input)
-            if idx is None:
-                raise ValueError("Movie not found in database.")
-            
-            # Determine which text column to use for similarity calculations
-            if 'description' in self.df.columns:
-                text_col = 'description'
-            elif 'overview' in self.df.columns:
-                text_col = 'overview'
-            else:
-                raise ValueError("No suitable text column found (expected 'description' or 'overview').")
-            
-            # Calculate TF-IDF using the selected text column
-            vectorizer = TfidfVectorizer()
-            tfidf_matrix = vectorizer.fit_transform(self.df[text_col].values.astype('U'))
-            
-            # Compute cosine similarity for the target movie using sparse multiplication
-            movie_vec = tfidf_matrix[idx]
-            sim_scores = movie_vec.dot(tfidf_matrix.T)
-            sim_scores = sim_scores.toarray().flatten()
-            
-            # Create a list of (movie_index, similarity_score) tuples
-            sim_scores = list(enumerate(sim_scores))
-            
-            # Sort scores in descending order, skipping the first entry (the movie itself)
-            sim_scores = sorted(sim_scores, key=lambda x: x[1], reverse=True)[1:see_top+1]
-            
-            # Extract valid movie indices
-            movie_indices = [i[0] for i in sim_scores]
-            valid_indices = [i for i in movie_indices if 0 <= i < len(self.df)]
-            
-            # Get the recommended movies (selecting only 'title' and 'genres' columns)
-            recommendations = self.df.iloc[valid_indices][['title', 'genres']]
-            return recommendations.sample(n=min(len(recommendations), see_top), random_state=random_seed)
-
-        except Exception as e:
-            print(f"Error: {e}")
-            return pd.DataFrame()
-
-
-
-
+#genre recommender
 class KnowledgeRecommender:
     
     def __init__(self, database):
@@ -519,23 +255,63 @@ keywords = r'keywords.csv'
 
 A1 = hybrid_recomsys(metadata_path, links_small_path, ratings_small_path)
 A1.prep_hybrid()
-#meta_data
-prepro = MergeCleanData(metadata_path, credits, keywords)
-database = prepro.main()
 
-make_soup= CreateSoup(database)
-database_soup = make_soup.main()
-
-recommender= ContentBasedRecommender(database_soup)
-
-#knowledge
 preference_scored= KnowledgeRecommender(metadata_path)
+
+#content based recommender
+def recommend(movie):
+    movie_index = movies[movies['title'] == movie].index[0] #its function that find index value from table
+    distances = similarity[movie_index] #measuring distance of array
+
+    movies_list = sorted(list(enumerate(distances)),reverse=True,key=lambda x:x[1])[1:6] 
+    
+    recommended_movie = []
+    recommended_movie_posters = []
+    for i in movies_list:
+    #now we are try to fetch the poster of movie with movie id
+        movie_id = movies.iloc[i[0]].movie_id
+
+        recommended_movie.append(movies.iloc[i[0]].title)
+        #fetch poster from API
+        #recommended_movie_posters.append(fetch_poste(movie_id))
+    return recommended_movie
+
+# assign .pkl file to the frontend to show the list of titles of movies
+movies_dict = pickle.load(open('movie_dict.pkl','rb'))
+movies = pd.DataFrame(movies_dict)
+    
+#import statemnt for similarity
+similarity = pickle.load(open('similarity.pkl','rb'))
 print("done")
 
 
 
+@app.route('/content-based', methods=['POST'])
+def content_based():
+    data = request.get_json()
+    if not data or 'movies' not in data:
+        return jsonify({'error': 'Please provide a list of movies in the JSON body with key "movies".'}), 400
+    
+    movies_list = data['movies']
+    if not isinstance(movies_list, list):
+        return jsonify({'error': 'Movies should be provided as a list.'}), 400
+    
+    try:
+        all_recommendations = []
+        for movie in movies_list:
+            rec = recommend(movie)
+            all_recommendations=rec+all_recommendations
+        return jsonify({'recommended_movies': all_recommendations})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
 
-@app.route('/recommend', methods=['POST'])
+
+
+
+
+
+
+@app.route('/recommend_genre', methods=['POST'])
 def recommend_movies():
     try:
         data = request.get_json()
@@ -560,60 +336,62 @@ def recommend_movies():
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
-@app.route('/get_movies', methods=['POST'])
-def get_movies():
-    try:
-        data = request.get_json()
-        title_input = data.get('title_input')
-        see_top = data.get('see_top', 10)
-        
-        if not title_input:
-            return jsonify({"error": "Missing title_input."}), 400
-        
-        # Get movie recommendations based on title input
-        recommended_movies = recommender.main(title_input=title_input, see_top=see_top)
-        
-        return jsonify(recommended_movies.to_dict('records'))
- 
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
-    
-@app.route('/add_movie', methods=['POST'])
-def add_movie():
-    try:
-        data = request.get_json()
-        user_id = data.get('user_id')
-        movie_name = data.get('movie_name')
-        rating = data.get('rating')
-        
-        if not all([user_id, movie_name, rating]):
-            return jsonify({"error": "Missing user_id, movie_name, or rating."}), 400
 
-        # Call the function to add a new rating
-        A1.add_new_rating(user_id, movie_name, rating)
-        
-        return jsonify({"message": "Movie rating added successfully!"})
 
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
+
+
+
     
 @app.route('/user_recommend', methods=['POST'])
 def user_recommend():
     try:
         data = request.get_json()
         user_id = data.get('user_id')
-        title = data.get('title')
-        
-        if not user_id or not title:
-            return jsonify({"error": "Missing user_id or title."}), 400
-        
-        # Get recommendations using A1.main
-        recommended_movies = A1.main(userId=user_id, title=title)
-        
-        return jsonify(recommended_movies.to_dict(orient='records'))
+        movies_list = data.get('movies')
+
+        if not user_id or not movies_list:
+            return jsonify({"error": "Missing user_id or movies list."}), 400
+
+        if not isinstance(movies_list, list):
+            return jsonify({"error": "Movies should be provided as a list."}), 400
+
+        all_recommendations = pd.DataFrame()  # Initialize an empty DataFrame
+
+        # Process each movie, skipping if an error occurs
+        for title in movies_list:
+            try:
+                rec = A1.main(userId=user_id, title=title)
+                all_recommendations = pd.concat([all_recommendations, rec])
+            except Exception as movie_error:
+                print(f"Error fetching recommendation for '{title}': {movie_error}")  # Log the error
+                continue  # Skip this movie and move to the next one
+
+        # Remove duplicates (if any)
+        all_recommendations = all_recommendations.drop_duplicates()
+
+        return jsonify(all_recommendations.to_dict(orient='records'))
 
     except Exception as e:
         return jsonify({"error": str(e)}), 500
+
+from rag import recommend_movies_rag, load_movie_data, search_by_genre,generate_recommendation,create_movie_embeddings
+
+@app.route('/rag-recommend', methods=['POST'])
+def rag_recommend():
+    data = request.get_json()
+    if not data or 'prompt' not in data:
+        return jsonify({"error": "Please provide a prompt in the JSON body with key 'prompt'."}), 400
+    
+    user_preferences = data['prompt']
+    csv_path = "wiki_movie_plots_deduped.csv"  # Ensure this CSV is in the correct path
+    recommendation_result = recommend_movies_rag(csv_path, user_preferences)
+    
+    if recommendation_result.get("status") != "success":
+        return jsonify({"error": recommendation_result.get("error", "Unknown error"), 
+                        "process_log": recommendation_result.get("process_log", [])}), 500
+    
+    return jsonify(recommendation_result)
+
 
 if __name__ == '__main__':
     app.run()
