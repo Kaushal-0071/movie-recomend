@@ -374,7 +374,7 @@ def user_recommend():
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
-from rag import recommend_movies_rag, load_movie_data, search_by_genre,generate_recommendation,create_movie_embeddings
+from rag import recommend_movies_rag
 
 @app.route('/rag-recommend', methods=['POST'])
 def rag_recommend():

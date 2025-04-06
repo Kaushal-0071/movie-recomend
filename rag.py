@@ -8,8 +8,6 @@ import google.generativeai as genai
 import re
 import json
 
-
-
 # Configure the Gemini API
 genai.configure(api_key="AIzaSyCUHMZpf2pJ9ezf-8w2sqJbUbvxpDH9ts8")
 
@@ -33,22 +31,75 @@ def create_movie_embeddings(df):
     tfidf_matrix = tfidf.fit_transform(df['combined_features'])
     return tfidf_matrix, tfidf
 
+# Extract genre keywords from user preferences
+def extract_genre_keywords(user_preferences):
+    return re.findall(
+        r'\b(?:action|comedy|drama|sci-fi|thriller|horror|romance|fantasy|animation|documentary|biography|musical|crime|war|western|history|sport|mystery)\b', 
+        user_preferences.lower()
+    )
+
+# Find movies similar to user preferences using both genre matching and TF-IDF embeddings
+def find_similar_movies_hybrid(user_preferences, df, tfidf_matrix, tfidf, top_n=5):
+    # Extract genre keywords from user preferences
+    genre_keywords = extract_genre_keywords(user_preferences)
+    
+    # Transform user preferences into the same vector space
+    user_vector = tfidf.transform([user_preferences])
+    
+    # Calculate cosine similarity between user preferences and all movies
+    cosine_sim = cosine_similarity(user_vector, tfidf_matrix).flatten()
+    
+    if genre_keywords:
+        # Calculate genre match score for all movies
+        genre_scores = np.zeros(len(df))
+        
+        for idx, row in df.iterrows():
+            if pd.notna(row['Genre']):
+                genre_text = row['Genre'].lower()
+                for keyword in genre_keywords:
+                    if keyword in genre_text:
+                        genre_scores[idx] += 1
+        
+        # Normalize genre scores to range 0-1
+        if genre_scores.max() > 0:
+            genre_scores = genre_scores / genre_scores.max()
+        
+        # Create a combined score with higher weight for genre matches
+        # Genre weight: 0.7, Similarity weight: 0.3
+        combined_scores = (0.7 * genre_scores) + (0.3 * cosine_sim)
+    else:
+        # If no genre keywords, use only cosine similarity
+        combined_scores = cosine_sim
+    
+    # Get indices of top movies by combined score
+    top_indices = combined_scores.argsort()[-top_n:][::-1]
+    
+    # Return the similar movies and their combined scores
+    return df.iloc[top_indices][['Title', 'Release Year', 'Director', 'Genre', 'Plot', 'Cast']].reset_index(drop=True), combined_scores[top_indices]
+
 # Generate a recommendation using Gemini with JSON output
-def generate_recommendation(user_preferences, similar_movies, df):
-    context = f"User preferences: {user_preferences}\n\nSimilar movies based on content:"
+def generate_recommendation(user_preferences, similar_movies, similarity_scores, df, genre_keywords=None):
+    context = f"User preferences: {user_preferences}\n"
+    if genre_keywords:
+        context += f"Detected genre interests: {', '.join(genre_keywords)}\n"
+    context += "\nSimilar movies based on content:"
+    
     movie_list = []
-    for i, movie in similar_movies.iterrows():
+    for i, (_, movie) in enumerate(similar_movies.iterrows()):
         release_year = movie['Release Year'] if pd.notna(movie['Release Year']) else 'N/A'
+        similarity_pct = round(similarity_scores[i] * 100, 2)
+        
         movie_details = {
             "title": movie['Title'],
             "release_year": release_year,
             "director": movie['Director'],
             "genre": movie['Genre'],
             "cast": movie['Cast'],
-            "plot": movie['Plot']
+            "plot": movie['Plot'],
+            "similarity_score": similarity_pct
         }
         movie_list.append(movie_details)
-        context += f"\n\n{i+1}. {movie['Title']} ({release_year})"
+        context += f"\n\n{i+1}. {movie['Title']} ({release_year}) - Match Score: {similarity_pct}%"
         context += f"\nDirector: {movie['Director']}"
         context += f"\nGenre: {movie['Genre']}"
         context += f"\nCast: {movie['Cast']}"
@@ -69,7 +120,7 @@ Provide your recommendation as a valid JSON object with the following structure:
     "genre": "Movie Genre"
   }},
   "recommendation_reason": "Detailed personalized explanation of why the user would enjoy this movie based on their preferences",
-  "similarity_score": A number between 0-100 representing how well this matches the user's preferences
+  "match_score": A number between 0-100 representing how well this matches the user's preferences
 }}
 
 Ensure the output is a valid, parseable JSON object with no additional text before or after.
@@ -86,42 +137,20 @@ Ensure the output is a valid, parseable JSON object with no additional text befo
             response_text = response_text[:-3]
         response_text = response_text.strip()
         recommendation_json = json.loads(response_text)
-        # Optionally include a few similar movies in the response
-        recommendation_json["similar_movies"] = [movie_list[i] for i in range(min(3, len(movie_list)))]
+        # Include top similar movies in the response
+        recommendation_json["similar_movies"] = movie_list
+        if genre_keywords:
+            recommendation_json["detected_genres"] = genre_keywords
         return recommendation_json
     except json.JSONDecodeError as e:
         fallback_json = {
             "error": "Failed to parse JSON response",
             "raw_response": response.text,
-            "similar_movies": movie_list[:3] if len(movie_list) >= 3 else movie_list
+            "similar_movies": movie_list
         }
         return fallback_json
 
-# Function to search for movies by genre keywords
-def search_by_genre(df, genre_keywords, top_n=5):
-    matched_movies = []
-    # Convert keywords to lowercase for case-insensitive matching
-    genre_keywords = [keyword.lower() for keyword in genre_keywords]
-    for idx, row in df.iterrows():
-        score = 0
-        if pd.notna(row['Genre']):
-            genre_text = row['Genre'].lower()
-            for keyword in genre_keywords:
-                if keyword in genre_text:
-                    score += 1
-        if score > 0:
-            matched_movies.append((idx, score))
-    # Sort by matching score (highest first)
-    matched_movies.sort(key=lambda x: x[1], reverse=True)
-    top_indices = [idx for idx, score in matched_movies[:top_n]]
-    
-    if not top_indices:
-        # Fallback: return the most recent movies if no match is found
-        return df.sort_values('Release Year', ascending=False).head(top_n)
-    
-    return df.iloc[top_indices][['Title', 'Release Year', 'Director', 'Genre', 'Plot', 'Cast']].reset_index(drop=True)
-
-# Main recommendation function using only user preferences (no reference movie)
+# Main recommendation function using hybrid approach
 def recommend_movies_rag(csv_path, user_preferences, top_n=5):
     result = {
         "status": "processing",
@@ -149,26 +178,28 @@ def recommend_movies_rag(csv_path, user_preferences, top_n=5):
         result["error"] = f"Failed to create embeddings: {str(e)}"
         return result
     
-    # Extract genre keywords from the user's preferences
-    result["process_log"].append("Extracting genre keywords from user preferences")
-    genre_keywords = re.findall(
-        r'\b(?:action|comedy|drama|sci-fi|thriller|horror|romance|fantasy|animation|documentary|biography|musical|crime|war|western|history|sport|mystery)\b', 
-        user_preferences.lower()
-    )
+    # Extract genre keywords from user preferences
+    genre_keywords = extract_genre_keywords(user_preferences)
     result["genre_keywords_found"] = genre_keywords
-    
     if genre_keywords:
-        similar_movies = search_by_genre(df, genre_keywords, top_n)
-        result["process_log"].append(f"Found {len(similar_movies)} movies matching genre keywords: {', '.join(genre_keywords)}")
+        result["process_log"].append(f"Detected genre keywords: {', '.join(genre_keywords)}")
     else:
-        result["process_log"].append("No specific genres identified. Using most recent movies")
-        similar_movies = df.sort_values('Release Year', ascending=False).head(top_n)
-        similar_movies = similar_movies[['Title', 'Release Year', 'Director', 'Genre', 'Plot', 'Cast']].reset_index(drop=True)
+        result["process_log"].append("No specific genres detected in user preferences")
+    
+    # Use hybrid approach (genre priority + TF-IDF embeddings) to find similar movies
+    result["process_log"].append("Finding movies using hybrid approach (genre priority + content similarity)")
+    try:
+        similar_movies, similarity_scores = find_similar_movies_hybrid(user_preferences, df, tfidf_matrix, tfidf, top_n)
+        result["process_log"].append(f"Found {len(similar_movies)} relevant movies using hybrid approach")
+    except Exception as e:
+        result["status"] = "error"
+        result["error"] = f"Failed to find similar movies: {str(e)}"
+        return result
     
     # Generate recommendation
     result["process_log"].append("Generating personalized recommendation")
     try:
-        recommendation = generate_recommendation(user_preferences, similar_movies, df)
+        recommendation = generate_recommendation(user_preferences, similar_movies, similarity_scores, df, genre_keywords)
         result["status"] = "success"
         result["recommendation"] = recommendation
         result["process_log"].append("Recommendation generated successfully")
@@ -178,4 +209,3 @@ def recommend_movies_rag(csv_path, user_preferences, top_n=5):
         return result
     
     return result
-
